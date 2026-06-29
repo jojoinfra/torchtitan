@@ -122,7 +122,11 @@ def kimi_k2_5_kimi_vl_a3b() -> Trainer.Config:
             ),
         ),
         hf_assets_path="./assets/hf/Kimi-VL-A3B",
-        tokenizer=MultiModalTokenizer.Config(**KIMI_K2_5_SPECIAL_TOKENS),
+        # Kimi-VL-A3B names the vision-start token <|media_start|>, whereas the
+        # K2.5 family uses <|media_begin|>; override just that one entry.
+        tokenizer=MultiModalTokenizer.Config(
+            **{**KIMI_K2_5_SPECIAL_TOKENS, "vision_start_token": "<|media_start|>"}
+        ),
         model_spec=model_spec,
         dataloader=_mm_dataloader("cc12m"),
         optimizer=default_adamw(lr=3e-4),

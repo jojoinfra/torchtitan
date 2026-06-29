@@ -67,7 +67,7 @@ def parallelize_kimi_k2_5(
     if parallel_dims.tp_enabled or parallel_dims.ep_enabled:
         if parallelism.enable_async_tensor_parallel and not model_compile_enabled:
             raise RuntimeError("Async TP requires torch.compile")
-        model.parallelize(parallel_dims)
+        model.parallelize(parallel_dims)  # pyrefly: ignore [not-callable]
 
     if parallel_dims.tp_enabled:
         maybe_enable_async_tp(parallelism, compile_config, parallel_dims.get_mesh("tp"))
@@ -79,7 +79,7 @@ def parallelize_kimi_k2_5(
             ac_policy.apply(model.vision_encoder)
 
     if model_compile_enabled:
-        apply_compile(model, compile_config)
+        apply_compile(model, compile_config)  # pyrefly: ignore [bad-argument-type]
         if model.vision_encoder is not None:
             apply_compile(model.vision_encoder, compile_config)
 
@@ -98,7 +98,7 @@ def parallelize_kimi_k2_5(
     # ``apply_fsdp_to_decoder``.
     if model.vision_encoder is not None and not parallel_dims.pp_enabled:
         apply_fsdp_to_vision_encoder(
-            model.vision_encoder,
+            model.vision_encoder,  # pyrefly: ignore [bad-argument-type]
             dp_mesh,
             param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
             reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
@@ -116,7 +116,7 @@ def parallelize_kimi_k2_5(
         edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
 
     apply_fsdp_to_decoder(
-        model,
+        model,  # pyrefly: ignore [bad-argument-type]
         dp_mesh,
         param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
         reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],

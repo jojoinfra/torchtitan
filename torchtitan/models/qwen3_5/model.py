@@ -329,6 +329,7 @@ class GatedDeltaNet(Module):
             # groups lands in a released torch.
             def _conv(x_local_BDL: torch.Tensor, w_local: torch.Tensor) -> torch.Tensor:
                 # groups == local out-channels (depthwise, channel-sharded)
+                # pyrefly: ignore [no-matching-overload]
                 return F.conv1d(
                     x_local_BDL,
                     w_local,

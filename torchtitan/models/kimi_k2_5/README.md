@@ -55,6 +55,7 @@ Test scripts:
 ## TODO
 
 - Add a video dataset training pipeline.
-- Add int4 (compressed-tensors) checkpoint loading for the K2.6 release (the
-  inherited DeepSeek-V3 adapter only dequantizes the fp8 block-scale format).
+- Add int4 (compressed-tensors) checkpoint loading. The released K2.5+ 1T weights
+  are int4 group-quantized; the inherited DeepSeek-V3 adapter only handles fp8
+  block-scale, so the 1T config trains from scratch but cannot load them yet.
 - Add Context Parallel (CP) support.

@@ -109,11 +109,18 @@ class KimiK25Model(DeepSeekV3Model):
         assert placeholder_id == special_tokens["video_id"]
 
         # Patches arrive float32; match the encoder's compute dtype for the matmul.
-        pixels = pixels.to(self.vision_encoder.patch_embed.weight.dtype)
-        vision_embeds = self.vision_encoder(pixels, grid_thw=grid)
+        pixels = pixels.to(
+            self.vision_encoder.patch_embed.weight.dtype
+        )  # pyrefly: ignore [missing-attribute]
+        vision_embeds = self.vision_encoder(
+            pixels, grid_thw=grid
+        )  # pyrefly: ignore [not-callable]
         # MoonViT collapses time (temporal pooling) and merges 2x2 spatially, so
         # the token count is (h/kh)*(w/kw), independent of t.
-        kh, kw = self.vision_encoder.merge_kernel_size
+        (
+            kh,
+            kw,
+        ) = self.vision_encoder.merge_kernel_size  # pyrefly: ignore [missing-attribute]
         num_tokens_per_item = (grid[:, 1] // kh) * (grid[:, 2] // kw)
         vision_positions = get_vision_positions(
             tokens, num_tokens_per_item, placeholder_id
