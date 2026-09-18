@@ -6,6 +6,7 @@
 
 _supported_experiments = frozenset(
     [
+        "anticipatory_routing",
         "graph_trainer.llama3",
         "graph_trainer.deepseek_v3",
         "graph_trainer.qwen3",
