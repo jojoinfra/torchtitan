@@ -88,6 +88,7 @@ class AnticipatoryTrainer(Trainer):
             self.engine.model_parts,
             index_store_dtype=config.anticipatory.index_store_dtype,
             offload_to_cpu=config.anticipatory.offload_indices_to_cpu,
+            device=self.engine.device,
         )
         self.engine.set_routing_cache(self.routing_cache)
         # The engine skips the loss all-reduce on steps the detector will not

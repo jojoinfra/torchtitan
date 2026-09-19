@@ -346,7 +346,9 @@ class AnticipatorySchedule:
                 slot: RoutingSlot = {}
                 with self.cache.capturing(slot):
                     self.engine.forward_only_microbatch(microbatch)
-                slots.append(slot)
+                # Outside the forward, so an offload cannot be traced into the
+                # compiled graph as a per-layer device-to-host copy.
+                slots.append(self.cache.offload_slot(slot))
 
         step_data.slots = slots
         # Parameters advance only at the optimizer step, so every slot captured

@@ -163,8 +163,23 @@ evidence rather than bitwise equality.
 - **No prefetch/EP-communication overlap**, so the overhead is roughly one extra
   forward per active step (+30-40%) rather than the ~20% reachable by
   overlapping the prefetch with expert-parallel all-to-all.
-- `torch.compile` builds extra graph variants for eval mode and for the replay
-  branch, so expect longer warmup.
+- `torch.compile` is supported at this seam, but only the seam has been checked.
+  A minimal reproduction of `_select_experts` -- the mode branch, the capture-time
+  dict write, and the replay-time dict read -- traces under `fullgraph=True` on
+  torch 2.7.1 with both the eager and inductor backends, and replay returns the
+  current step's indices rather than freezing the first step's into the graph.
+  Mode x train/eval x grad/no-grad produced 6 unique graphs against a
+  `cache_size_limit` of 8, and the schedule reaches only 3 of those combinations.
+  Host transfers for `offload_indices_to_cpu` are deliberately kept out of the
+  traced region -- `capture` narrows the dtype on device and `offload_slot` /
+  `select` do the copies outside the forward, because a `.to("cpu")` reached
+  from inside the router is captured into the graph as a per-layer,
+  per-microbatch sync.
+  Not yet checked: the same seam inside the real model, where it also has to
+  survive the `routing_decision` remat region, the spmd_types annotations, the
+  `RoutedExperts` local-SPMD boundary, activation checkpointing and FSDP. Run the
+  `delay_steps=0` gate above with `--compile.components model loss` to confirm --
+  a frozen-graph replay would surface there as a loss divergence from step 1.
 - **Checkpointing is paused while the mode is armed.** During warmup and the
   active phase the prefetch has consumed `delay_steps` steps' worth of data, so
   the dataloader state a checkpoint would capture sits that far ahead of the

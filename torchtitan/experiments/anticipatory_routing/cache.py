@@ -72,12 +72,14 @@ class RoutingIndexCache:
         self,
         *,
         store_dtype: torch.dtype,
+        device: torch.device,
         offload_to_cpu: bool = False,
     ) -> None:
         self.mode = RoutingMode.OFF
         self.slot: RoutingSlot | None = None
         self.step_slots: list[RoutingSlot] | None = None
         self.store_dtype = store_dtype
+        self.device = device
         self.offload_to_cpu = offload_to_cpu
 
     @contextlib.contextmanager
@@ -105,9 +107,21 @@ class RoutingIndexCache:
             self.slot = self.step_slots = None
 
     def select(self, accumulation_index: int) -> None:
-        """Point ``slot`` at the microbatch about to run. No-op when off."""
-        if self.step_slots is not None:
-            self.slot = self.step_slots[accumulation_index]
+        """Point ``slot`` at the microbatch about to run. No-op when off.
+
+        Called from the engine, outside any compiled region, which is why the
+        host-to-device transfer for offloaded indices belongs here: inside the
+        router it would land in the traced graph as a per-layer sync.
+        """
+        if self.step_slots is None:
+            return
+        slot = self.step_slots[accumulation_index]
+        if self.offload_to_cpu:
+            slot = {
+                key: ids.to(self.device, non_blocking=True)
+                for key, ids in slot.items()
+            }
+        self.slot = slot
 
     def capture(self, key: str, topk_expert_ids_TK: torch.Tensor) -> None:
         """Store one router's indices for the microbatch being executed."""
@@ -116,13 +130,18 @@ class RoutingIndexCache:
                 "RoutingIndexCache is in CAPTURE mode with no slot set. The "
                 "trainer must assign a slot before each microbatch forward."
             )
+        # Narrowing the dtype is a cheap on-device cast and is fine to trace.
+        # The host transfer is deliberately not done here -- this runs inside
+        # the model's forward, so under torch.compile a ``.to("cpu")`` would be
+        # captured into the graph as a device-to-host copy, once per router per
+        # microbatch. ``offload_slot`` does it afterwards instead.
+        #
         # copy=True even when the dtype already matches: without it ``to``
         # returns the caller's tensor, which is still attached to the forward
         # that produced it.
-        stored = topk_expert_ids_TK.detach().to(dtype=self.store_dtype, copy=True)
-        if self.offload_to_cpu:
-            stored = stored.to("cpu")
-        self.slot[key] = stored
+        self.slot[key] = topk_expert_ids_TK.detach().to(
+            dtype=self.store_dtype, copy=True
+        )
 
     def replay(self, key: str) -> torch.Tensor:
         """Return the indices cached for this router in the current slot."""
@@ -141,6 +160,17 @@ class RoutingIndexCache:
                 "pass must visit every router the training forward visits."
             )
         return cached
+
+
+    def offload_slot(self, slot: RoutingSlot) -> RoutingSlot:
+        """Move one captured slot to host memory, if offloading is configured.
+
+        Call after the capture forward has returned, never inside it: the
+        transfer must stay out of any compiled region.
+        """
+        if not self.offload_to_cpu:
+            return slot
+        return {key: ids.to("cpu", non_blocking=True) for key, ids in slot.items()}
 
 
 def slot_nbytes(slot: RoutingSlot) -> int:

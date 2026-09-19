@@ -138,6 +138,7 @@ def build_routing_cache(
     *,
     index_store_dtype: IndexStoreDtype,
     offload_to_cpu: bool,
+    device: torch.device,
 ) -> RoutingIndexCache:
     """Create the shared cache and attach it to every anticipatory router.
 
@@ -171,6 +172,7 @@ def build_routing_cache(
     num_experts = routers[0][1].num_experts
     cache = RoutingIndexCache(
         store_dtype=resolve_store_dtype(index_store_dtype, num_experts),
+        device=device,
         offload_to_cpu=offload_to_cpu,
     )
     for key, router in routers:
