@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import enum
+from collections.abc import Iterator
 from typing import Literal
 
 import torch
@@ -60,10 +62,10 @@ def resolve_store_dtype(name: IndexStoreDtype, num_experts: int) -> torch.dtype:
 class RoutingIndexCache:
     """Store the anticipatory routers read from and write to.
 
-    One instance is shared by every router in the model. The trainer sets
-    ``mode`` and ``slot`` around each microbatch forward; a router only ever
-    looks at those two fields, so nothing has to thread an extra argument
-    through the model.
+    One instance is shared by every router in the model. A router only reads
+    ``mode`` and ``slot``, so nothing has to thread an extra argument through
+    the model. Those two fields are only ever set through :meth:`capturing` and
+    :meth:`replaying`, so they cannot fall out of step with each other.
     """
 
     def __init__(
@@ -74,8 +76,38 @@ class RoutingIndexCache:
     ) -> None:
         self.mode = RoutingMode.OFF
         self.slot: RoutingSlot | None = None
+        self.step_slots: list[RoutingSlot] | None = None
         self.store_dtype = store_dtype
         self.offload_to_cpu = offload_to_cpu
+
+    @contextlib.contextmanager
+    def capturing(self, slot: RoutingSlot) -> Iterator[None]:
+        """Collect one forward's routing indices into ``slot``."""
+        self.mode, self.slot = RoutingMode.CAPTURE, slot
+        try:
+            yield
+        finally:
+            self.mode, self.slot = RoutingMode.OFF, None
+
+    @contextlib.contextmanager
+    def replaying(self, step_slots: list[RoutingSlot] | None) -> Iterator[None]:
+        """Replay one optimizer step's cached indices, one slot per microbatch.
+
+        ``None`` runs the step with the cache off, which is what ordinary
+        training and the drain phase do.
+        """
+        self.mode = RoutingMode.REPLAY if step_slots is not None else RoutingMode.OFF
+        self.step_slots = step_slots
+        try:
+            yield
+        finally:
+            self.mode = RoutingMode.OFF
+            self.slot = self.step_slots = None
+
+    def select(self, accumulation_index: int) -> None:
+        """Point ``slot`` at the microbatch about to run. No-op when off."""
+        if self.step_slots is not None:
+            self.slot = self.step_slots[accumulation_index]
 
     def capture(self, key: str, topk_expert_ids_TK: torch.Tensor) -> None:
         """Store one router's indices for the microbatch being executed."""

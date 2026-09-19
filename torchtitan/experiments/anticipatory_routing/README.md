@@ -39,6 +39,17 @@ it installs the router override, forces CUDA graphs off, and attaches a
 checkpointer. Key knobs live under `--anticipatory.*` and
 `--anticipatory.detector.*`.
 
+## Layout
+
+| file | holds |
+|---|---|
+| `schedule.py` | `AnticipatorySchedule` — the phase machine, the prefetch queue, and the spike response. Everything that makes this different from ordinary training. |
+| `trainer.py` | `AnticipatoryTrainer` — config validation and wiring. `train_step` runs the base step inside the schedule's step scope and does nothing else. |
+| `engine.py` | The forward-only pass, mid-run rollback, and the per-step loss reduction the detector reads. |
+| `router.py` | The `_select_experts` mixin and the `@override` factory that installs it. |
+| `cache.py` | The index store and the scoped `capturing` / `replaying` modes routers read. |
+| `detector.py` | Loss-spike detection. |
+
 ## How it works
 
 **Router seam.** `AnticipatoryRoutingMixin` overrides

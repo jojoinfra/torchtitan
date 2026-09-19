@@ -99,7 +99,6 @@ class LossSpikeDetector(Configurable):
         self.config = config
         self._recent: deque[tuple[int, float]] = deque(maxlen=config.onset_lookback)
         self._last_trigger_step = -config.cooldown_steps - 1
-        self._frozen_steps = 0
         self.reset()
 
     def reset(self) -> None:

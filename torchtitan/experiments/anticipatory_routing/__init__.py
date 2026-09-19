@@ -19,12 +19,15 @@ reverts to standard training.
 from .config import AnticipatoryRoutingConfig
 from .detector import LossSpikeDetector
 from .engine import AnticipatoryTrainingEngine
+from .schedule import AnticipatorySchedule, Phase
 from .trainer import AnticipatoryTrainer
 
 
 __all__ = [
     "AnticipatoryRoutingConfig",
+    "AnticipatorySchedule",
     "AnticipatoryTrainer",
     "AnticipatoryTrainingEngine",
     "LossSpikeDetector",
+    "Phase",
 ]

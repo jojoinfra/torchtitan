@@ -20,7 +20,7 @@ from torchtitan.protocols import BaseModel
 from torchtitan.tools import filesystem
 from torchtitan.training_engine import TrainingEngine
 
-from .cache import RoutingIndexCache, RoutingMode, RoutingSlot
+from .cache import RoutingIndexCache
 
 
 logger = logging.getLogger(__name__)
@@ -42,20 +42,12 @@ class AnticipatoryTrainingEngine(TrainingEngine):
         self.last_global_loss = None
         self.suppress_checkpoint_saves = False
         self.loss_reduce_every = 1
-        self._step_routing_slots: list[RoutingSlot] | None = None
         self._step_loss_sum: torch.Tensor | None = None
 
     # -- routing cache plumbing ------------------------------------------
 
     def set_routing_cache(self, cache: RoutingIndexCache) -> None:
         self.routing_cache = cache
-
-    def set_step_routing_slots(self, slots: list[RoutingSlot] | None) -> None:
-        """Supply this optimizer step's index slots, one per accumulation unit.
-
-        ``None`` means the step runs with the cache off.
-        """
-        self._step_routing_slots = slots
 
     def forward_backward_microbatch(
         self,
@@ -70,18 +62,13 @@ class AnticipatoryTrainingEngine(TrainingEngine):
         keeps the loss on logging steps, but the spike detector needs it every
         step, and doing it here avoids touching the base ``train_step``.
         """
-        cache = self.routing_cache
-        if cache is not None and cache.mode is not RoutingMode.OFF:
+        if self.routing_cache is not None:
             # Without pipeline parallelism a microbatch group holds exactly one
             # microbatch, so the accumulation index identifies it. A pipeline
             # schedule interleaves the forwards of a group's microbatches, which
             # is why pipeline parallelism is rejected in the trainer config.
             assert len(microbatch_group) == 1
-            assert self._step_routing_slots is not None
-            cache.slot = self._step_routing_slots[accumulation_index]
-
-        if accumulation_index == 0:
-            self._step_loss_sum = None
+            self.routing_cache.select(accumulation_index)
 
         detached_loss = super().forward_backward_microbatch(
             microbatch_group=microbatch_group,
@@ -89,9 +76,10 @@ class AnticipatoryTrainingEngine(TrainingEngine):
             accumulation_index=accumulation_index,
         )
 
-        if self._step_loss_sum is None:
+        if accumulation_index == 0:
             self._step_loss_sum = detached_loss.clone()
         else:
+            assert self._step_loss_sum is not None
             self._step_loss_sum.add_(detached_loss)
         return detached_loss
 
@@ -189,20 +177,24 @@ class AnticipatoryTrainingEngine(TrainingEngine):
         if not checkpointer._storage.isdir(folder):
             return None
 
-        best: int | None = None
-        for dirname in checkpointer._storage.listdir(folder):
-            step = checkpointer._parse_step(dirname)
-            # Step 0 is a seed checkpoint and holds model state only, so it
-            # cannot restore the optimizer or the data stream.
-            if step is None or step <= 0 or step >= onset_step:
-                continue
-            if not checkpointer._is_resumable_checkpoint(
-                filesystem.join(folder, dirname)
-            ):
-                continue
-            if best is None or step > best:
-                best = step
-        return best
+        # Step 0 is a seed checkpoint and holds model state only, so it cannot
+        # restore the optimizer or the data stream.
+        steps = (
+            checkpointer._parse_step(d)
+            for d in checkpointer._storage.listdir(folder)
+        )
+        return max(
+            (
+                step
+                for step in steps
+                if step is not None
+                and 0 < step < onset_step
+                and checkpointer._is_resumable_checkpoint(
+                    filesystem.join(folder, f"step-{step}")
+                )
+            ),
+            default=None,
+        )
 
     @sl.log_trace_span("anticipatory_rollback")
     def rollback_to(self, step: int) -> None:
@@ -214,9 +206,6 @@ class AnticipatoryTrainingEngine(TrainingEngine):
         checkpointer.maybe_wait_for_saving()
         checkpointer.load(step=step)
         self._reset_transient_training_state()
-        # The caller warms the index cache next, which runs the data stream
-        # ahead; saving before it drains would persist a mismatched pair.
-        self.suppress_checkpoint_saves = True
         logger.info(
             "Rolled back to step %d; %d completed steps, %d tokens seen.",
             step,
