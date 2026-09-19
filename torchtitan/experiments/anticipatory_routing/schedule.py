@@ -62,12 +62,14 @@ class StepData:
     ``load_times`` travels with the batch so the data-loading cost is credited
     to the step that trains on it, not the step that fetched it. ``slots`` holds
     the routing indices captured for these microbatches, or ``None`` when the
-    step routes live.
+    step routes live, and ``captured_at_step`` is the number of optimizer steps
+    completed when they were captured -- the other half of the staleness check.
     """
 
     microbatches: list[TrainingMicrobatch]
     load_times: list[float]
     slots: list[RoutingSlot] | None = None
+    captured_at_step: int | None = None
 
 
 class SuppliedMicrobatches:
@@ -154,6 +156,7 @@ class AnticipatorySchedule:
         self._arm_pending = config.always_on
         self._pending_load_times: list[float] = []
         self._phase_at_step_start = Phase.NORMAL
+        self._logged_steady_lag = False
 
         if keep_latest_k > 0:
             logger.warning(
@@ -239,7 +242,38 @@ class AnticipatorySchedule:
             # they are trained normally rather than dropped, which is what keeps
             # the data stream contiguous. Their cached indices go unused.
             step_data.slots = None
+            return step_data
+        self._check_staleness(step_data)
         return step_data
+
+    def _check_staleness(self, step_data: StepData) -> None:
+        """Verify how old this step's routing indices actually are.
+
+        This is the property the whole feature exists to produce, and nothing
+        else states it: it emerges from the queue arithmetic, where warmup
+        pushes ``delay_steps`` entries and every step afterwards pushes one and
+        pops one. Checking it here means a broken push/pop order fails loudly
+        instead of quietly degrading to fresh routing -- which trains perfectly
+        well and would pass every loss-based test.
+
+        The lag ramps 0..``delay_steps`` while the warmup backlog drains, then
+        holds there for the rest of the active window.
+        """
+        assert step_data.captured_at_step is not None
+        lag = self.engine.num_completed_steps - step_data.captured_at_step
+        assert 0 <= lag <= self.config.delay_steps, (
+            f"Routing indices are {lag} optimizer steps old, outside the "
+            f"0..{self.config.delay_steps} the schedule can produce. The "
+            "prefetch queue is out of step with the training loop."
+        )
+        if lag == self.config.delay_steps and not self._logged_steady_lag:
+            self._logged_steady_lag = True
+            logger.info(
+                "Anticipatory routing at steady state: training step %d is "
+                "routing on indices computed %d optimizer step(s) ago.",
+                self.engine.num_completed_steps + 1,
+                lag,
+            )
 
     def _end_step(self, data_iterator: Iterator[TrainingMicrobatch]) -> None:
         """Spend the step, then react to the loss it produced."""
@@ -315,6 +349,9 @@ class AnticipatorySchedule:
                 slots.append(slot)
 
         step_data.slots = slots
+        # Parameters advance only at the optimizer step, so every slot captured
+        # in this call belongs to the same theta.
+        step_data.captured_at_step = self.engine.num_completed_steps
         self._queue.append(step_data)
         return True
 
@@ -358,6 +395,7 @@ class AnticipatorySchedule:
         """
         config = self.config
         self._queue.clear()
+        self._logged_steady_lag = False
         with sl.log_trace_span("anticipatory_warmup"):
             for _ in range(config.delay_steps):
                 if not self._prefetch_and_capture(data_iterator):

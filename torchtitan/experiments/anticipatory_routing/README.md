@@ -25,6 +25,15 @@ Spike detected at step 200, rollback to step 100, `delay_steps = 11`:
 | drain x11 | none | queued data, routing computed fresh |
 
 Every index consumed in a train step is `delay_steps` optimizer steps stale.
+`AnticipatorySchedule._check_staleness` asserts that at the moment a queued
+batch is taken off the queue, so a broken push/pop order fails loudly rather
+than quietly reverting to fresh routing -- which trains fine and would pass any
+loss-based test.
+
+Warmup is a phase in this table but not a member of the `Phase` enum: it runs
+inline inside the spike handler and takes no optimizer step, so it is a stretch
+of wall-clock time rather than a state the training loop passes through. The
+enum has the three states a *step* can be in.
 
 ## Usage
 
