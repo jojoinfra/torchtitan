@@ -15,6 +15,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from spmd_types import SpmdType
+from torch.testing._internal.distributed._tensor.common_dtensor import (
+    DTensorTestBase,
+    with_comms,
+)
 
 from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.distributed.spmd_types import _per_axis_types
@@ -37,6 +41,7 @@ from torchtitan.models.common.linear import (
     RowParallelLinear,
 )
 from torchtitan.models.common.moe import (
+    collect_moe_load_metrics,
     MoE,
     RoundRobinTokenChoiceTopKRouter,
     TokenChoiceTopKRouter,
@@ -149,6 +154,48 @@ class _IdentityW2(nn.Module):
     def forward(self, hidden_RD, offsets_E):
         del offsets_E
         return hidden_RD
+
+
+def _build_moe(num_experts: int = 2) -> MoE:
+    dim = 4
+    top_k = 1
+    moe = make_moe_config(
+        num_experts=num_experts,
+        router=make_router_config(
+            dim=dim,
+            num_experts=num_experts,
+            gate_param_init={"weight": nn.init.zeros_},
+            score_func=Sigmoid.Config(),
+            top_k=top_k,
+        ),
+        routed_experts=make_routed_experts_config(
+            dim=dim,
+            hidden_dim=8,
+            num_experts=num_experts,
+            top_k=top_k,
+            param_init={},
+            enable_ep=False,
+        ),
+        load_balance_coeff=1e-3,
+        enable_sp=True,
+    ).build()
+    with torch.no_grad():
+        moe.router.gate.weight.zero_()
+    moe.routed_experts = _PassthroughRoutedExperts()
+    return moe
+
+
+def _model_part_with_expert_counts(
+    counts_by_layer: dict[str, list[float]],
+) -> nn.Module:
+    """A model part whose ``layers.{key}.moe`` routers hold the given counts."""
+    layers = nn.ModuleDict()
+    for key, counts_E in counts_by_layer.items():
+        block = nn.Module()
+        block.moe = _build_moe(num_experts=len(counts_E))
+        block.moe.router.tokens_per_expert_E.copy_(torch.tensor(counts_E))
+        layers[key] = block
+    return nn.ModuleDict({"layers": layers})
 
 
 class TestMoE(unittest.TestCase):
@@ -330,39 +377,10 @@ class TestMoE(unittest.TestCase):
                     atol=0,
                 )
 
-    def _build_moe(self):
-        num_experts = 2
-        dim = 4
-        top_k = 1
-        moe = make_moe_config(
-            num_experts=num_experts,
-            router=make_router_config(
-                dim=dim,
-                num_experts=num_experts,
-                gate_param_init={"weight": nn.init.zeros_},
-                score_func=Sigmoid.Config(),
-                top_k=top_k,
-            ),
-            routed_experts=make_routed_experts_config(
-                dim=dim,
-                hidden_dim=8,
-                num_experts=num_experts,
-                top_k=top_k,
-                param_init={},
-                enable_ep=False,
-            ),
-            load_balance_coeff=1e-3,
-            enable_sp=True,
-        ).build()
-        with torch.no_grad():
-            moe.router.gate.weight.zero_()
-        moe.routed_experts = _PassthroughRoutedExperts()
-        return moe
-
     def test_eval_forward_does_not_accumulate_tokens_per_expert(self):
         dim = 4
         top_k = 1
-        moe = self._build_moe()
+        moe = _build_moe()
 
         x_TD = torch.randn(6, dim)
         moe.train()
@@ -380,7 +398,7 @@ class TestMoE(unittest.TestCase):
         )
 
     def test_padding_is_excluded_from_counts_but_still_dispatched(self):
-        moe = self._build_moe()
+        moe = _build_moe()
         x_TD = torch.randn(6, 4)
         padding_mask_T = torch.tensor([False, False, False, True, True, True])
 
@@ -709,6 +727,165 @@ class TestMoE(unittest.TestCase):
                 grouped_linear.sharding_config.state_shardings["weight"],
                 dense_param_placement(tp=spmd.R),
             )
+
+
+_SINGLE_RANK = SimpleNamespace(
+    ep_enabled=False, tp=1, get_optional_mesh=lambda name: None
+)
+
+
+class TestCollectMoELoadMetrics(unittest.TestCase):
+    def test_reports_summaries_and_per_layer_statistics(self):
+        model_part = _model_part_with_expert_counts({"0": [3.0, 1.0], "1": [2.0, 0.0]})
+        metrics = collect_moe_load_metrics(
+            [model_part],
+            ["layers.0.moe", "layers.1.moe"],
+            _SINGLE_RANK,
+            per_layer=True,
+        )
+
+        expected = {
+            "moe_load/max_vio_mean": 0.75,
+            "moe_load/max_vio_max": 1.0,
+            "moe_load/cv_mean": 0.75,
+            "moe_load/dead_experts": 1.0,
+            "moe_load_per_layer/layers.0.moe/max_vio": 0.5,
+            "moe_load_per_layer/layers.0.moe/cv": 0.5,
+            "moe_load_per_layer/layers.0.moe/dead_experts": 0.0,
+            "moe_load_per_layer/layers.1.moe/max_vio": 1.0,
+            "moe_load_per_layer/layers.1.moe/cv": 1.0,
+            "moe_load_per_layer/layers.1.moe/dead_experts": 1.0,
+        }
+        self.assertEqual(metrics.keys(), expected.keys())
+        for key, value in expected.items():
+            self.assertAlmostEqual(metrics[key], value, places=6, msg=key)
+        # Reading copies the counts: the balancing hook still needs them.
+        torch.testing.assert_close(
+            model_part.layers["0"].moe.router.tokens_per_expert_E,
+            torch.tensor([3.0, 1.0]),
+        )
+
+    def test_layer_without_tokens_reports_zeros(self):
+        model_part = _model_part_with_expert_counts({"0": [0.0, 0.0]})
+        metrics = collect_moe_load_metrics(
+            [model_part], ["layers.0.moe"], _SINGLE_RANK, per_layer=False
+        )
+        self.assertEqual(
+            metrics,
+            {
+                "moe_load/max_vio_mean": 0.0,
+                "moe_load/max_vio_max": 0.0,
+                "moe_load/cv_mean": 0.0,
+                "moe_load/dead_experts": 2.0,
+            },
+        )
+
+    def test_dense_model_reports_nothing(self):
+        metrics = collect_moe_load_metrics(
+            [nn.Linear(2, 2)], [], _SINGLE_RANK, per_layer=True
+        )
+        self.assertEqual(metrics, {})
+
+    def test_rejects_moe_layer_missing_from_config(self):
+        model_part = _model_part_with_expert_counts({"0": [1.0, 1.0]})
+        with self.assertRaisesRegex(AssertionError, "layers.0.moe"):
+            collect_moe_load_metrics(
+                [model_part], ["layers.1.moe"], _SINGLE_RANK, per_layer=False
+            )
+
+
+class TestCollectMoELoadMetricsDistributed(DTensorTestBase):
+    """dp2/cp2/pp2 on CPU + gloo: the four DP/CP ranks of a stage route
+    different tokens, and each stage holds different MoE layers."""
+
+    @property
+    def world_size(self):
+        return 8
+
+    @property
+    def device_type(self):
+        return "cpu"
+
+    def _build_dims(self):
+        from torchtitan.distributed.parallelism_context import ParallelismContext
+
+        with patch("torchtitan.distributed.parallelism_context.device_type", "cpu"):
+            parallelism_context = ParallelismContext(
+                dp_replicate=1,
+                dp_shard=2,
+                cp=2,
+                tp=1,
+                pp=2,
+                ep=1,
+                world_size=8,
+                enable_sequence_parallel=False,
+            )
+            parallelism_context.build_mesh()
+        return parallelism_context
+
+    @with_comms
+    def test_sums_loss_mesh_and_gathers_stages(self):
+        parallelism_context = self._build_dims()
+        pp_rank = parallelism_context.get_mesh("pp").get_local_rank()
+        loss_rank = parallelism_context.get_mesh("loss").get_local_rank()
+        # Stage 0 holds layer 0, stage 1 layers 1 and 2. Global counts:
+        #   layer 0: one expert per loss rank -> [1, 1, 1, 1]
+        #   layer 1: loss_rank + 1 on expert 0 -> [10, 0, 0, 0]
+        #   layer 2: the same on every rank   -> [4, 4, 0, 0]
+        if pp_rank == 0:
+            counts = {"0": [float(e == loss_rank) for e in range(4)]}
+        else:
+            counts = {"1": [loss_rank + 1.0, 0.0, 0.0, 0.0], "2": [1.0, 1.0, 0.0, 0.0]}
+        model_part = _model_part_with_expert_counts(counts)
+
+        metrics = collect_moe_load_metrics(
+            [model_part],
+            ["layers.0.moe", "layers.1.moe", "layers.2.moe"],
+            parallelism_context,
+            per_layer=True,
+        )
+
+        sqrt3 = 3.0**0.5
+        expected = {
+            "moe_load/max_vio_mean": 4.0 / 3.0,
+            "moe_load/max_vio_max": 3.0,
+            "moe_load/cv_mean": (sqrt3 + 1.0) / 3.0,
+            "moe_load/dead_experts": 5.0,
+            "moe_load_per_layer/layers.0.moe/max_vio": 0.0,
+            "moe_load_per_layer/layers.0.moe/cv": 0.0,
+            "moe_load_per_layer/layers.0.moe/dead_experts": 0.0,
+            "moe_load_per_layer/layers.1.moe/max_vio": 3.0,
+            "moe_load_per_layer/layers.1.moe/cv": sqrt3,
+            "moe_load_per_layer/layers.1.moe/dead_experts": 3.0,
+            "moe_load_per_layer/layers.2.moe/max_vio": 1.0,
+            "moe_load_per_layer/layers.2.moe/cv": 1.0,
+            "moe_load_per_layer/layers.2.moe/dead_experts": 2.0,
+        }
+        self.assertEqual(metrics.keys(), expected.keys())
+        for key, value in expected.items():
+            self.assertAlmostEqual(metrics[key], value, places=5, msg=key)
+
+    @with_comms
+    def test_stage_without_moe_layers_joins_the_gather(self):
+        """A dense first stage (e.g. DeepSeek's leading dense layers) must
+        still join the pipeline reduction instead of deadlocking it."""
+        parallelism_context = self._build_dims()
+        pp_rank = parallelism_context.get_mesh("pp").get_local_rank()
+        if pp_rank == 0:
+            model_part = nn.ModuleDict(
+                {"layers": nn.ModuleDict({"0": nn.Linear(2, 2)})}
+            )
+        else:
+            model_part = _model_part_with_expert_counts({"1": [1.0, 0.0]})
+
+        with patch("torchtitan.models.common.moe.device_type", "cpu"):
+            metrics = collect_moe_load_metrics(
+                [model_part], ["layers.1.moe"], parallelism_context, per_layer=False
+            )
+
+        # Four loss ranks each route one token to expert 0: [4, 0].
+        self.assertAlmostEqual(metrics["moe_load/max_vio_max"], 1.0, places=6)
+        self.assertEqual(metrics["moe_load/dead_experts"], 1.0)
 
 
 if __name__ == "__main__":

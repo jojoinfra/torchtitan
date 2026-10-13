@@ -29,6 +29,7 @@ from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.cuda_graph import cuda_graphs_supported
 from torchtitan.models.base.model import BaseModel
 from torchtitan.models.common.aux_loss import collect_aux_loss_metrics
+from torchtitan.models.common.moe import collect_moe_load_metrics, MoE
 from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.metrics import ensure_pp_loss_visible, MetricsProcessor
 from torchtitan.training_engine import TrainingEngine
@@ -146,6 +147,7 @@ class Trainer(Configurable):
     dataloader: BaseDataLoader
     validator: BaseValidator
     metrics_processor: MetricsProcessor
+    moe_fqns: list[str]
     gradient_accumulation_steps: int
     num_pp_microbatches: int
 
@@ -194,6 +196,9 @@ class Trainer(Configurable):
             has_quantization=engine.has_quantization,
         )
         color = self.metrics_processor.color
+        # From the config, not the local modules: identical on every rank,
+        # including pipeline stages that hold no MoE layer.
+        self.moe_fqns = [fqn for fqn, *_ in engine.model_config.traverse(MoE.Config)]
 
         self.num_pp_microbatches = (
             config.parallelism.num_pp_microbatches
@@ -404,6 +409,17 @@ class Trainer(Configurable):
         # Capture the learning rates used by this optimizer update before the
         # scheduler advances in engine.optim_step().
         lr_metrics = engine.optim.lr_schedulers.get_metrics() if should_log else {}
+        # Read the expert loads before the optimizer step pre-hooks reset them.
+        moe_load_metrics = (
+            collect_moe_load_metrics(
+                engine.model_parts,
+                self.moe_fqns,
+                parallelism_context,
+                per_layer=self.config.metrics.log_moe_load_per_layer,
+            )
+            if should_log
+            else {}
+        )
         grad_norm = engine.optim_step()
 
         # log metrics
@@ -454,6 +470,7 @@ class Trainer(Configurable):
             "n_tokens_seen": global_ntokens_seen,
             **lr_metrics,
             **collect_aux_loss_metrics(parallelism_context),
+            **moe_load_metrics,
         }
         self.metrics_processor.log(
             engine.num_completed_steps,

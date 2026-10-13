@@ -2,8 +2,30 @@ We support automatically collecting metrics such as
 1. High level system metrics such as MFU, average loss, max loss and words per second along with some
 2. Memory metrics to measure max VRAM consumption and the number of OOMs
 3. Timing metrics to measure data loading bottlenecks
+4. MoE expert-load metrics to detect routing imbalance (MoE models only)
 
 Those metrics can then be visualized in either a TensorBoard or WandDB dashboard
+
+## MoE expert load
+
+For MoE models, every log step reports how evenly the routers spread tokens
+across experts. The load of an expert is the number of routing assignments it
+received over the whole global batch (each token counts once per selected
+expert; padding is excluded). With an expert-bias update the counts are reset
+every step, so the load covers that step; without one (frozen expert bias, or
+`load_balance_coeff=None`) it accumulates since the start of training.
+Per MoE layer:
+
+| Statistic | Definition | Balanced value |
+|---|---|---|
+| `max_vio` | (max load - mean load) / mean load | 0 |
+| `cv` | std / mean of the loads | 0 |
+| `dead_experts` | experts that received no token | 0 |
+
+`moe_load/max_vio_mean`, `moe_load/max_vio_max`, `moe_load/cv_mean` and
+`moe_load/dead_experts` summarize them over layers (dead experts are summed).
+Set `metrics.log_moe_load_per_layer` to also log
+`moe_load_per_layer/{layer fqn}/{statistic}` for every MoE layer.
 
 ## TensorBoard
 

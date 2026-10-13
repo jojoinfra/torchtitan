@@ -130,6 +130,8 @@ def _training_loop(trainer: TrainingEngine) -> SimpleNamespace:
         trainer.optim_step = lambda: TrainingEngine.optim_step(trainer)
     if not hasattr(trainer.config, "model"):
         trainer.config.model = SimpleNamespace(traverse=lambda _: iter(()))
+    if not hasattr(trainer.config, "metrics"):
+        trainer.config.metrics = SimpleNamespace(log_moe_load_per_layer=False)
 
     return SimpleNamespace(
         engine=trainer,
@@ -137,6 +139,7 @@ def _training_loop(trainer: TrainingEngine) -> SimpleNamespace:
         gradient_accumulation_steps=trainer.gradient_accumulation_steps,
         num_pp_microbatches=trainer.num_pp_microbatches,
         metrics_processor=trainer.metrics_processor,
+        moe_fqns=[],
     )
 
 

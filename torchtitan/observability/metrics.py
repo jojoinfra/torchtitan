@@ -346,6 +346,13 @@ class MetricsProcessor(Configurable):
         enable_wandb: bool = False
         """Whether to log metrics to Weights & Biases"""
 
+        log_moe_load_per_layer: bool = False
+        """
+        Whether to also log the expert-load statistics of every MoE layer
+        (``moe_load_per_layer/{fqn}/{max_vio,cv,dead_experts}``). The
+        ``moe_load/`` summaries over layers are always logged for MoE models.
+        """
+
         def __post_init__(self) -> None:
             if self.log_freq <= 0:
                 raise ValueError("metrics.log_freq must be greater than 0.")

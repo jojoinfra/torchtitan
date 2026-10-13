@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import cast, Protocol
 
@@ -40,6 +40,7 @@ from torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.hi_mid_lo_linear import HiMidLoLinear
 from torchtitan.models.common.linear import GroupedLinear
+from torchtitan.tools.utils import device_type
 
 from .token_dispatcher import LocalTokenDispatcher
 
@@ -55,7 +56,8 @@ from .token_dispatcher import LocalTokenDispatcher
 #   O = expert output features, I = expert input features
 #       (roles, not model dims: the _grouped_mm seam takes the expert
 #        weight in its stored (E, O, I) orientation, which is (E, F, D)
-#        for the up/gate projections and (E, D, F) for the down one)
+#        for the up/gate projections and (E, D, F) for the down one),
+#   L = num MoE layers, S = expert-load statistics per layer
 
 
 class RoutedExperts(Module):
@@ -1126,6 +1128,110 @@ def _should_register_moe_balancing_hook(moe_layers: list[_MoELike]) -> bool:
             "MoE freeze_expert_bias must be configured consistently "
             "across all MoE layers."
         )
-    # TODO: frozen layers never zero router.tokens_per_expert_E (or the quantile
-    # histogram). Add a zero-only hook once something else reads them.
+    # TODO: without a bias update (frozen, or load_balance_coeff=None) nothing
+    # zeroes router.tokens_per_expert_E (or the quantile histogram), so
+    # collect_moe_load_metrics reports the load accumulated since the start of
+    # training. Add a zero-only hook to report a single step.
     return not frozen
+
+
+_MOE_LOAD_STATS = ("max_vio", "cv", "dead_experts")
+
+
+@torch.no_grad()
+def collect_moe_load_metrics(
+    model_parts: Sequence[nn.Module],
+    moe_fqns: list[str],
+    parallelism_context: ParallelismContext,
+    *,
+    per_layer: bool,
+) -> dict[str, float]:
+    """Reduce the routers' expert loads into logging metrics, read-only.
+
+    Per MoE layer, over the global ``router.tokens_per_expert_E`` counts:
+
+    - ``max_vio``: (max load - mean load) / mean load, 0 when balanced
+    - ``cv``: std / mean of the expert loads
+    - ``dead_experts``: number of experts that received no token
+
+    Returns ``moe_load/{max_vio_mean, max_vio_max, cv_mean, dead_experts}``
+    (means / max over layers, dead experts summed), plus
+    ``moe_load_per_layer/{fqn}/{stat}`` when ``per_layer`` is set; ``{}``
+    without MoE layers.
+
+    All ranks must call this after forward/backward and before the optimizer
+    step. The counts cover the current step when an expert-bias update
+    pre-hook resets them every step; without one (frozen bias, or
+    ``load_balance_coeff=None``) they accumulate since the start of training.
+
+    Args:
+        model_parts: Local model parts, holding any subset of ``moe_fqns``.
+        moe_fqns: FQNs of every MoE layer in the full model, identical on all
+            ranks, e.g. from ``model_config.traverse(MoE.Config)``.
+        parallelism_context: Parallel dimensions for distributed communication.
+        per_layer: Whether to also return the per-layer values.
+    """
+    if not moe_fqns:
+        return {}
+    layer_index = {fqn: i for i, fqn in enumerate(moe_fqns)}
+
+    local_indices: list[int] = []
+    local_counts: list[torch.Tensor] = []
+    for model_part in model_parts:
+        for fqn, module in model_part.named_modules():
+            if isinstance(module, MoE):
+                assert fqn in layer_index, (
+                    f"MoE layer {fqn!r} is not among the model config's MoE "
+                    "layers, so its load would be silently dropped."
+                )
+                local_indices.append(layer_index[fqn])
+                local_counts.append(module.router.tokens_per_expert_E)
+
+    device = local_counts[0].device if local_counts else torch.device(device_type)
+    stats_LS = torch.zeros(
+        len(moe_fqns), len(_MOE_LOAD_STATS), dtype=torch.float32, device=device
+    )
+    # All ranks of a pipeline stage hold the same layers, so the stage either
+    # joins both reductions below or skips both.
+    if local_counts:
+        # vstack copies: the balancing hooks still need the local counts.
+        counts_LE = torch.vstack(local_counts)
+        # Same reductions as the expert-bias update: global counts per layer.
+        if parallelism_context.ep_enabled and parallelism_context.tp > 1:
+            torch.distributed.all_reduce(
+                counts_LE, group=parallelism_context.get_dense_tp_mesh().get_group()
+            )
+        loss_mesh = parallelism_context.get_optional_mesh("loss")
+        if loss_mesh is not None:
+            torch.distributed.all_reduce(counts_LE, group=loss_mesh.get_group())
+
+        mean_L = counts_LE.mean(dim=1)
+        # A layer that routed no token reports zeros instead of NaN.
+        denominator_L = mean_L.clamp_min(torch.finfo(counts_LE.dtype).tiny)
+        stats_LS[local_indices] = torch.stack(
+            [
+                (counts_LE.amax(dim=1) - mean_L) / denominator_L,
+                counts_LE.std(dim=1, correction=0) / denominator_L,
+                (counts_LE == 0).sum(dim=1).to(stats_LS.dtype),
+            ],
+            dim=1,
+        )
+
+    pp_mesh = parallelism_context.get_optional_mesh("pp")
+    if pp_mesh is not None:
+        # Every layer lives on exactly one stage: summing gathers all layers.
+        torch.distributed.all_reduce(stats_LS, group=pp_mesh.get_group())
+
+    stats = stats_LS.tolist()
+    max_vios = [layer_stats[0] for layer_stats in stats]
+    metrics = {
+        "moe_load/max_vio_mean": sum(max_vios) / len(stats),
+        "moe_load/max_vio_max": max(max_vios),
+        "moe_load/cv_mean": sum(layer_stats[1] for layer_stats in stats) / len(stats),
+        "moe_load/dead_experts": sum(layer_stats[2] for layer_stats in stats),
+    }
+    if per_layer:
+        for fqn, layer_stats in zip(moe_fqns, stats, strict=True):
+            for name, value in zip(_MOE_LOAD_STATS, layer_stats, strict=True):
+                metrics[f"moe_load_per_layer/{fqn}/{name}"] = value
+    return metrics
